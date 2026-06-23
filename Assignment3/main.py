@@ -12,6 +12,13 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
 
+SAMPLE_RATE = 51200
+WINDOW_DURATION = 3
+SAMPLES_PER_WINDOW = SAMPLE_RATE * WINDOW_DURATION
+SAMPLES_PER_BLOCK = 600
+BLOCKS_PER_WINDOW = 256
+WINDOWS_PER_FILE = 40
+
 # Try importing TdmsFile
 try:
     from nptdms import TdmsFile
@@ -91,29 +98,36 @@ def extract_bogie_window(data, sampling_rate=51200, window_duration=3):
     # Use Acceleration Mod1Ai0 (accelerometer A, X direction)
     ax = data['Acceleration Mod1Ai0']
     
-    samples_per_window = sampling_rate * window_duration  # 153,600 samples
-    samples_per_block = 600
-    blocks_per_window = 256
-    
     # Extract windows
-    n_complete_windows = len(ax) // samples_per_window
+    n_complete_windows = len(ax) // SAMPLES_PER_WINDOW
     
     all_window_features = []
     
     for w in range(n_complete_windows):
-        start_idx = w * samples_per_window
-        end_idx = start_idx + samples_per_window
+        start_idx = w * SAMPLES_PER_WINDOW
+        end_idx = start_idx + SAMPLES_PER_WINDOW
         window_data = ax[start_idx:end_idx]
         
         # Reshape into 256 blocks of 600 samples
-        window_data = window_data[:blocks_per_window * samples_per_block]
-        blocks = window_data.reshape((blocks_per_window, samples_per_block))
+        window_data = window_data[:BLOCKS_PER_WINDOW * SAMPLES_PER_BLOCK]
+        blocks = window_data.reshape((BLOCKS_PER_WINDOW, SAMPLES_PER_BLOCK))
         
         # Extract features for each block
         window_features = np.array([extract_features(block) for block in blocks])
         all_window_features.append(window_features)
     
     return np.array(all_window_features)  # Shape: (n_windows, 256, 7)
+
+
+def select_assignment_windows(window_features, max_windows=WINDOWS_PER_FILE):
+    """Keep the middle pass segment, matching the assignment's S1S2 crop."""
+    n_windows = window_features.shape[0]
+    if n_windows <= max_windows:
+        return window_features
+
+    start = (n_windows - max_windows) // 2
+    end = start + max_windows
+    return window_features[start:end]
 
 
 def load_all_data():
@@ -132,6 +146,7 @@ def load_all_data():
             print(f"  Processing {filepath.name}...")
             data = load_tdms_file(filepath)
             features = extract_bogie_window(data)  # Shape: (n_windows, 256, 7)
+            features = select_assignment_windows(features)
             
             all_features.append(features)
             # Each file contributes n_windows labels
@@ -160,9 +175,9 @@ def build_lstm_model(input_shape):
     Output: 4 classes (L0, L1, L2, L3)
     """
     model = Sequential([
-        LSTM(64, activation='relu', input_shape=input_shape, return_sequences=True),
+        LSTM(64, input_shape=input_shape, return_sequences=True),
         Dropout(0.3),
-        LSTM(32, activation='relu', return_sequences=False),
+        LSTM(32, return_sequences=False),
         Dropout(0.3),
         Dense(16, activation='relu'),
         Dropout(0.2),
@@ -193,14 +208,7 @@ if __name__ == '__main__':
     print(f"Data shape: {X.shape}")
     print(f"Labels shape: {y.shape}")
     print(f"Class distribution: {np.bincount(y)}")
-    
-    # Normalize features
-    print("\nNormalizing features...")
-    X_reshaped = X.reshape(-1, X.shape[-1])
-    scaler = StandardScaler()
-    X_normalized = scaler.fit_transform(X_reshaped)
-    X = X_normalized.reshape(X.shape)
-    
+
     # Train/test split (60/40)
     print("\nSplitting data...")
     X_train, X_test, y_train, y_test = train_test_split(
@@ -208,40 +216,35 @@ if __name__ == '__main__':
     )
     print(f"Training set: {X_train.shape}")
     print(f"Test set: {X_test.shape}")
+
+    # Normalize using training data only to avoid leaking test statistics.
+    print("\nNormalizing features using the training set only...")
+    scaler = StandardScaler()
+    X_train_shape = X_train.shape
+    X_test_shape = X_test.shape
+    X_train = scaler.fit_transform(X_train.reshape(-1, X_train_shape[-1])).reshape(X_train_shape)
+    X_test = scaler.transform(X_test.reshape(-1, X_test_shape[-1])).reshape(X_test_shape)
     
     # Build and train LSTM
     print("\nBuilding LSTM model...")
     model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
     model.summary()
     
-    # Calculate class weights - using manual calculation to avoid extreme values
-    n_samples = len(y_train)
-    n_classes = len(np.unique(y_train))
-    
     # Count samples per class
     class_counts = np.bincount(y_train)
     print(f"\nTraining class distribution: {class_counts}")
     
-    # Use inverse frequency weighting: weight = total_samples / (n_classes * class_count)
-    class_weights = n_samples / (n_classes * class_counts)
-    # Normalize by dividing by minimum weight to keep values reasonable
-    class_weights = class_weights / class_weights.min()
-    
-    class_weight_dict = {i: float(w) for i, w in enumerate(class_weights)}
-    print(f"Class weights (normalized): {class_weight_dict}")
-    
     # Add early stopping
     from tensorflow.keras.callbacks import EarlyStopping
-    early_stop = EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True, verbose=1)
+    early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=1)
     
-    print("\nTraining model with normalized class weights...")
+    print("\nTraining model...")
     history = model.fit(
         X_train, y_train,
-        epochs=150,
-        batch_size=16,
+        epochs=100,
+        batch_size=32,
         validation_split=0.1,
         verbose=1,
-        class_weight=class_weight_dict,
         callbacks=[early_stop]
     )
     
