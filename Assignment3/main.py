@@ -1,6 +1,8 @@
 import numpy as np
 from pathlib import Path
 import tensorflow as tf
+from nptdms import TdmsFile
+import pywt
 from tensorflow import keras
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -15,71 +17,18 @@ warnings.filterwarnings('ignore')
 SAMPLE_RATE = 51200
 WINDOW_DURATION = 3
 SAMPLES_PER_WINDOW = SAMPLE_RATE * WINDOW_DURATION
+
 SAMPLES_PER_BLOCK = 600
 BLOCKS_PER_WINDOW = 256
 WINDOWS_PER_FILE = 40
-
-# Try importing TdmsFile
-try:
-    from nptdms import TdmsFile
-except ImportError:
-    print("Installing nptdms...")
-    import subprocess
-    subprocess.check_call(['pip', 'install', 'nptdms'])
-    from nptdms import TdmsFile
-
-# ============================================================================
-# STEP 1: EXTRACT 7 FEATURES PER BLOCK
-# ============================================================================
-
-def extract_features(block):
-    """
-    Extract 7 time-domain features from a block of 600 samples.
-    
-    Features:
-    1. RMS - Root Mean Square
-    2. Skewness
-    3. Kurtosis
-    4. Shape factor - RMS / mean(|x|)
-    5. Crest factor - max(|x|) / RMS
-    6. Impulse factor - max(|x|) / mean(|x|)
-    7. Clearance - max(|x|) / (mean(sqrt(|x|)))^2
-    """
-    N = len(block)
-    m = np.mean(block)  # mean
-    sigma = np.std(block, ddof=1)  # standard deviation
-    
-    # 1. RMS
-    rms = np.sqrt(np.mean(block**2))
-    
-    # 2. Skewness
-    skewness = np.sum((block - m)**3) / ((N - 1) * sigma**3) if sigma != 0 else 0
-    
-    # 3. Kurtosis
-    kurtosis = np.sum((block - m)**4) / ((N - 1) * sigma**4) if sigma != 0 else 0
-    
-    # 4. Shape factor
-    shape_factor = rms / np.mean(np.abs(block)) if np.mean(np.abs(block)) != 0 else 0
-    
-    # 5. Crest factor
-    crest_factor = np.max(np.abs(block)) / rms if rms != 0 else 0
-    
-    # 6. Impulse factor
-    impulse_factor = np.max(np.abs(block)) / np.mean(np.abs(block)) if np.mean(np.abs(block)) != 0 else 0
-    
-    # 7. Clearance (margin)
-    sqrt_mean = np.mean(np.sqrt(np.abs(block)))
-    clearance = np.max(np.abs(block)) / (sqrt_mean**2) if sqrt_mean != 0 else 0
-    
-    return np.array([rms, skewness, kurtosis, shape_factor, crest_factor, impulse_factor, clearance])
+PREVIEW_SAMPLES = 5
+TARGET_CROP_SECONDS = 120
+EPOCHS = 100
+BATCH_SIZE = 32
 
 
 def load_tdms_file(filepath):
-    """Load TDMS file and return accelerometer data."""
     tdms_file = TdmsFile.read(filepath)
-    
-    # TDMS file structure: groups and channels
-    # Extract channels from the group 'Untitled'
     data = {}
     for group in tdms_file.groups():
         for channel in group.channels():
@@ -88,207 +37,391 @@ def load_tdms_file(filepath):
     return data
 
 
-def extract_bogie_window(data, sampling_rate=51200, window_duration=3):
-    """
-    Extract 3-second windows and reshape into 256 blocks of 600 samples.
-    
-    Returns:
-    - features: (n_windows, 256, 7) - 256 time-steps with 7 features each
-    """
-    # Use Acceleration Mod1Ai0 (accelerometer A, X direction)
-    ax = data['Acceleration Mod1Ai0']
-    
-    # Extract windows
-    n_complete_windows = len(ax) // SAMPLES_PER_WINDOW
-    
-    all_window_features = []
-    
-    for w in range(n_complete_windows):
-        start_idx = w * SAMPLES_PER_WINDOW
-        end_idx = start_idx + SAMPLES_PER_WINDOW
-        window_data = ax[start_idx:end_idx]
-        
-        # Reshape into 256 blocks of 600 samples
-        window_data = window_data[:BLOCKS_PER_WINDOW * SAMPLES_PER_BLOCK]
-        blocks = window_data.reshape((BLOCKS_PER_WINDOW, SAMPLES_PER_BLOCK))
-        
-        # Extract features for each block
-        window_features = np.array([extract_features(block) for block in blocks])
-        all_window_features.append(window_features)
-    
-    return np.array(all_window_features)  # Shape: (n_windows, 256, 7)
+def format_preview(values, max_items=PREVIEW_SAMPLES):
+    preview = np.asarray(values[:max_items])
+    return np.array2string(preview, precision=4, separator=', ')
 
-
-def select_assignment_windows(window_features, max_windows=WINDOWS_PER_FILE):
-    """Keep the middle pass segment, matching the assignment's S1S2 crop."""
-    n_windows = window_features.shape[0]
-    if n_windows <= max_windows:
-        return window_features
-
-    start = (n_windows - max_windows) // 2
-    end = start + max_windows
-    return window_features[start:end]
 
 
 def load_all_data():
     """Load all TDMS files and extract features."""
-    data_dir = Path('Assignment3/data')
+    data_dir = Path(__file__).resolve().parent / 'data'
     labels = ['L0', 'L1', 'L2', 'L3']
+
+    loaded_data = []
+    loaded_labels = []
+    for tdms_file in sorted(data_dir.glob('*.tdms')):
+        label = tdms_file.name.split('_', 1)[0]
+        if label not in labels:
+            continue
+
+        data = load_tdms_file(tdms_file)
+        loaded_data.append({
+            'file': tdms_file.name,
+            'channels': data,
+        })
+        loaded_labels.append(label)
     
-    all_features = []
-    all_labels = []
-    
-    for label in labels:
-        files = sorted(list(data_dir.glob(f'{label}*.tdms')))
-        print(f"Found {len(files)} files for {label}")
-        
-        for filepath in files:
-            print(f"  Processing {filepath.name}...")
-            data = load_tdms_file(filepath)
-            features = extract_bogie_window(data)  # Shape: (n_windows, 256, 7)
-            features = select_assignment_windows(features)
-            
-            all_features.append(features)
-            # Each file contributes n_windows labels
-            all_labels.extend([label] * features.shape[0])
-    
-    # Combine all data
-    X = np.vstack(all_features)  # Shape: (total_windows, 256, 7)
-    y = np.array(all_labels)
-    
-    # Convert labels to numeric (L0=0, L1=1, L2=2, L3=3)
-    label_map = {'L0': 0, 'L1': 1, 'L2': 2, 'L3': 3}
-    y_numeric = np.array([label_map[label] for label in y])
-    
-    return X, y_numeric
+    return loaded_data, loaded_labels
+
+def print_data_summary(data, labels):
+    """Print a summary of the loaded data."""
+    print(f"Total files loaded: {len(data)}")
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    for label, count in zip(unique_labels, counts):
+        print(f"Label {label}: {count} files")
+
+    for item, label in zip(data, labels):
+        file_path = Path(__file__).resolve().parent / 'data' / item['file']
+        file_size_kb = file_path.stat().st_size / 1024
+        print(f"\n{item['file']} ({label})")
+        print(f"  Size: {file_size_kb:.1f} KB")
+
+        for channel_name, channel_data in item['channels'].items():
+            sample_count = len(channel_data)
+            preview = format_preview(channel_data)
+            print(f"  {channel_name}: {sample_count} samples, first {PREVIEW_SAMPLES} = {preview}")
 
 
-# ============================================================================
-# STEP 2: BUILD THE LSTM
-# ============================================================================
+def crop_data(data, crop_seconds=TARGET_CROP_SECONDS):
+    """Crop the centered middle section to a fixed duration in seconds."""
+
+    target_samples = int(crop_seconds * SAMPLE_RATE)
+    cropped_data = []
+    for item in data:
+        cropped_item = {
+            'file': item['file'],
+            'channels': {}
+        }
+        for channel_name, channel_data in item['channels'].items():
+            channel_data = np.asarray(channel_data)
+            sample_count = len(channel_data)
+
+            window_samples = min(sample_count, target_samples)
+            start_index = max((sample_count - window_samples) // 2, 0)
+            end_index = start_index + window_samples
+            cropped_item['channels'][channel_name] = channel_data[start_index:end_index]
+        cropped_data.append(cropped_item)
+    return cropped_data
+
+
+def wavelet_denoise_signal(signal, wavelet='db4', level=None):
+    """Denoise a 1D signal using wavelet thresholding."""
+
+    signal = np.asarray(signal)
+    if signal.size < 4:
+        return signal.copy()
+
+    max_level = pywt.dwt_max_level(signal.size, pywt.Wavelet(wavelet).dec_len)
+    if max_level <= 0:
+        return signal.copy()
+
+    if level is None:
+        level = min(4, max_level)
+    else:
+        level = min(level, max_level)
+
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
+    if len(coeffs) < 2:
+        return signal.copy()
+
+    detail_coeffs = coeffs[1:]
+    sigma = np.median(np.abs(detail_coeffs[-1])) / 0.6745
+    threshold = sigma * np.sqrt(2 * np.log(signal.size))
+
+    coeffs[1:] = [pywt.threshold(coeff, threshold, mode='soft') for coeff in detail_coeffs]
+    denoised_signal = pywt.waverec(coeffs, wavelet)
+    return denoised_signal[:signal.size]
+
+
+def wavelet_denoise_data(data, wavelet='db4', level=None):
+    """Apply wavelet denoising to every channel in every file."""
+
+    denoised_data = []
+    for item in data:
+        denoised_item = {
+            'file': item['file'],
+            'channels': {},
+        }
+        for channel_name, channel_data in item['channels'].items():
+            denoised_item['channels'][channel_name] = wavelet_denoise_signal(
+                channel_data,
+                wavelet=wavelet,
+                level=level,
+            )
+        denoised_data.append(denoised_item)
+    return denoised_data
+
+
+def extract_block_features(block):
+    """Compute the 7 requested time-domain features for one block."""
+
+    block = np.asarray(block)
+    n = block.size
+    if n == 0:
+        return np.zeros(7, dtype=float)
+
+    eps = 1e-12
+    mean_val = np.mean(block)
+    abs_mean = np.mean(np.abs(block))
+    rms = np.sqrt(np.mean(np.square(block)))
+    sigma = np.std(block, ddof=1) if n > 1 else 0.0
+
+    centered = block - mean_val
+    denom = max(n - 1, 1)
+    skewness = np.sum(centered ** 3) / (denom * (sigma ** 3 + eps))
+    kurtosis = np.sum(centered ** 4) / (denom * (sigma ** 4 + eps))
+
+    max_abs = np.max(np.abs(block))
+    shape_factor = rms / (abs_mean + eps)
+    crest_factor = max_abs / (rms + eps)
+    impulse_factor = max_abs / (abs_mean + eps)
+    clearance = max_abs / (np.mean(np.sqrt(np.abs(block))) ** 2 + eps)
+
+    return np.array([
+        rms,
+        skewness,
+        kurtosis,
+        shape_factor,
+        crest_factor,
+        impulse_factor,
+        clearance,
+    ], dtype=float)
+
+
+def windowing(data, window_size=SAMPLES_PER_WINDOW, block_size=SAMPLES_PER_BLOCK, blocks_per_window=BLOCKS_PER_WINDOW):
+    """Split signals into windows and return per-window tensors of shape (256, 7)."""
+
+    if block_size * blocks_per_window != window_size:
+        raise ValueError("window_size must equal block_size * blocks_per_window")
+
+    windowed_data = []
+    for item in data:
+        windowed_item = {
+            'file': item['file'],
+            'channels': {},
+        }
+
+        for channel_name, channel_data in item['channels'].items():
+            channel_data = np.asarray(channel_data)
+            num_windows = len(channel_data) // window_size
+            channel_window_features = []
+
+            for window_idx in range(num_windows):
+                start = window_idx * window_size
+                end = start + window_size
+                window_signal = channel_data[start:end]
+                blocks = window_signal.reshape(blocks_per_window, block_size)
+
+                block_features = np.vstack([extract_block_features(block) for block in blocks])
+                channel_window_features.append(block_features)
+
+            if channel_window_features:
+                windowed_item['channels'][channel_name] = np.stack(channel_window_features, axis=0)
+            else:
+                windowed_item['channels'][channel_name] = np.empty((0, blocks_per_window, 7), dtype=float)
+
+        windowed_data.append(windowed_item)
+
+    return windowed_data
+
+    
+
+
+
+
+
+
+    
+
 
 def build_lstm_model(input_shape):
-    """
-    Build LSTM model for wear classification with focal loss for class imbalance.
-    
-    Input shape: (256 time-steps, 7 features)
-    Output: 4 classes (L0, L1, L2, L3)
-    """
+    """Build and compile the LSTM model."""
     model = Sequential([
-        LSTM(64, input_shape=input_shape, return_sequences=True),
-        Dropout(0.3),
-        LSTM(32, return_sequences=False),
-        Dropout(0.3),
-        Dense(16, activation='relu'),
+        LSTM(64, return_sequences=True, input_shape=input_shape),
         Dropout(0.2),
-        Dense(4, activation='softmax')  # 4 classes
+        LSTM(32),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(4, activation='softmax'),
     ])
-    
-    # Use Adam with moderate learning rate
-    optimizer = keras.optimizers.Adam(learning_rate=0.001)
-    
-    # Use focal loss from tf_addons for better class imbalance handling
-    # Fallback to weighted cross-entropy if focal loss not available
+
     model.compile(
-        optimizer=optimizer,
+        optimizer='adam',
         loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
+        metrics=['accuracy'],
     )
-    
     return model
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+def build_sequence_split_dataset(windowed_data, labels, train_ratio=0.6):
+    """Build train/validation sets by splitting each file sequence temporally."""
+
+    label_names = sorted(set(labels))
+    label_to_idx = {label: idx for idx, label in enumerate(label_names)}
+
+    channel_sets = [set(item['channels'].keys()) for item in windowed_data]
+    common_channels = sorted(set.intersection(*channel_sets))
+    if not common_channels:
+        raise ValueError('No common channels across all files for sequence building.')
+
+    x_train, y_train = [], []
+    x_val, y_val = [], []
+
+    for item, label in zip(windowed_data, labels):
+        per_channel = [item['channels'][channel] for channel in common_channels]
+        num_windows = min(channel_tensor.shape[0] for channel_tensor in per_channel)
+        if num_windows < 2:
+            continue
+
+        sequence_tensor = np.concatenate(
+            [channel_tensor[:num_windows] for channel_tensor in per_channel],
+            axis=2,
+        )
+
+        split_idx = int(np.floor(num_windows * train_ratio))
+        split_idx = min(max(split_idx, 1), num_windows - 1)
+
+        x_train.extend(sequence_tensor[:split_idx])
+        y_train.extend([label_to_idx[label]] * split_idx)
+
+        x_val.extend(sequence_tensor[split_idx:])
+        y_val.extend([label_to_idx[label]] * (num_windows - split_idx))
+
+    x_train = np.asarray(x_train, dtype=np.float32)
+    y_train = np.asarray(y_train, dtype=np.int32)
+    x_val = np.asarray(x_val, dtype=np.float32)
+    y_val = np.asarray(y_val, dtype=np.int32)
+
+    if x_train.size == 0 or x_val.size == 0:
+        raise ValueError('Not enough windowed data to build train/validation sets.')
+
+    return x_train, y_train, x_val, y_val, label_names, common_channels
+
+
+def standardize_sequence_features(x_train, x_val):
+    """Standardize features using train-set statistics only."""
+
+    n_train, t_steps, n_features = x_train.shape
+    n_val = x_val.shape[0]
+
+    scaler = StandardScaler()
+    x_train_2d = x_train.reshape(-1, n_features)
+    x_val_2d = x_val.reshape(-1, n_features)
+
+    x_train_scaled = scaler.fit_transform(x_train_2d).reshape(n_train, t_steps, n_features)
+    x_val_scaled = scaler.transform(x_val_2d).reshape(n_val, t_steps, n_features)
+    return x_train_scaled, x_val_scaled, scaler
+
+
+def save_confusion_matrix_artifacts(y_true, y_pred, label_names, output_dir):
+    """Save confusion matrix image and CSV to disk."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(label_names)))
+
+    cm_csv_path = output_dir / 'confusion_matrix.csv'
+    np.savetxt(cm_csv_path, cm, delimiter=',', fmt='%d')
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt='d',
+        cmap='Blues',
+        xticklabels=label_names,
+        yticklabels=label_names,
+    )
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('LSTM Confusion Matrix')
+    plt.tight_layout()
+    cm_png_path = output_dir / 'confusion_matrix.png'
+    plt.savefig(cm_png_path)
+    plt.close()
+
+    return cm, cm_csv_path, cm_png_path
+
+
+def compute_per_class_accuracy(cm, label_names):
+    """Compute per-class accuracy as recall for each class."""
+
+    per_class = {}
+    for idx, label in enumerate(label_names):
+        class_total = np.sum(cm[idx, :])
+        if class_total == 0:
+            per_class[label] = 0.0
+        else:
+            per_class[label] = cm[idx, idx] / class_total
+    return per_class
+
 
 if __name__ == '__main__':
+
     print("Loading data...")
-    X, y = load_all_data()
-    print(f"Data shape: {X.shape}")
-    print(f"Labels shape: {y.shape}")
-    print(f"Class distribution: {np.bincount(y)}")
+    data, labels = load_all_data()  
+    print_data_summary(data, labels)
 
-    # Train/test split (60/40)
-    print("\nSplitting data...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.4, random_state=42, stratify=y
+    
+    denoised_data = wavelet_denoise_data(data)
+
+    print("\nDenoised data summary:")
+    print_data_summary(denoised_data, labels)
+
+
+    cropped_data = crop_data(denoised_data)
+
+    print("\nCropped data summary:")
+    print_data_summary(cropped_data, labels)
+
+    windowed_feature_data = windowing(cropped_data)
+    print("\nWindow feature tensor shapes (num_windows, 256, 7):")
+    for item in windowed_feature_data:
+        channel_name = next(iter(item['channels']))
+        print(f"{item['file']} - {channel_name}: {item['channels'][channel_name].shape}")
+
+    x_train, y_train, x_val, y_val, label_names, used_channels = build_sequence_split_dataset(
+        windowed_feature_data,
+        labels,
+        train_ratio=0.6,
     )
-    print(f"Training set: {X_train.shape}")
-    print(f"Test set: {X_test.shape}")
+    print(f"\nUsing channels for training: {used_channels}")
+    print(f"Train samples: {x_train.shape[0]}, Validation samples: {x_val.shape[0]}")
 
-    # Normalize using training data only to avoid leaking test statistics.
-    print("\nNormalizing features using the training set only...")
-    scaler = StandardScaler()
-    X_train_shape = X_train.shape
-    X_test_shape = X_test.shape
-    X_train = scaler.fit_transform(X_train.reshape(-1, X_train_shape[-1])).reshape(X_train_shape)
-    X_test = scaler.transform(X_test.reshape(-1, X_test_shape[-1])).reshape(X_test_shape)
-    
-    # Build and train LSTM
-    print("\nBuilding LSTM model...")
-    model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
-    model.summary()
-    
-    # Count samples per class
-    class_counts = np.bincount(y_train)
-    print(f"\nTraining class distribution: {class_counts}")
-    
-    # Add early stopping
-    from tensorflow.keras.callbacks import EarlyStopping
-    early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=1)
-    
-    print("\nTraining model...")
+    x_train, x_val, scaler = standardize_sequence_features(x_train, x_val)
+
+    model = build_lstm_model(input_shape=x_train.shape[1:])
     history = model.fit(
-        X_train, y_train,
-        epochs=100,
-        batch_size=32,
-        validation_split=0.1,
+        x_train,
+        y_train,
+        validation_data=(x_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
         verbose=1,
-        callbacks=[early_stop]
     )
-    
-    # Save model
-    print("\nSaving model...")
-    model.save('Assignment3/output/wear_lstm_model.h5')
-    
-    # Evaluate on test set
-    print("\nEvaluating on test set...")
-    test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
-    print(f"Test accuracy: {test_accuracy:.4f}")
-    
-    # Generate predictions and confusion matrix
-    print("\nGenerating predictions...")
-    y_pred_probs = model.predict(X_test, verbose=0)
-    y_pred = np.argmax(y_pred_probs, axis=1)
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
-    print("\nConfusion Matrix:")
+
+    val_pred_prob = model.predict(x_val, verbose=0)
+    y_pred = np.argmax(val_pred_prob, axis=1)
+    val_acc = accuracy_score(y_val, y_pred)
+    print(f"\nValidation accuracy: {val_acc:.4f}")
+    print("\nClassification report:")
+    print(classification_report(y_val, y_pred, target_names=label_names, digits=4))
+
+    output_dir = Path(__file__).resolve().parent / 'output'
+    cm, cm_csv_path, cm_png_path = save_confusion_matrix_artifacts(
+        y_val,
+        y_pred,
+        label_names,
+        output_dir,
+    )
+
+    print("\nConfusion matrix:")
     print(cm)
-    
-    # Compute per-class accuracy
-    per_class_accuracy = cm.diagonal() / cm.sum(axis=1)
-    class_names = ['L0', 'L1', 'L2', 'L3']
+    per_class_acc = compute_per_class_accuracy(cm, label_names)
     print("\nPer-class accuracy:")
-    for i, cls in enumerate(class_names):
-        print(f"  {cls}: {per_class_accuracy[i]:.4f}")
-    
-    # Plot confusion matrix
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=class_names, yticklabels=class_names,
-                cbar_kws={'label': 'Count'})
-    plt.title(f'Confusion Matrix (Overall Accuracy: {test_accuracy:.4f})')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.tight_layout()
-    plt.savefig('Assignment3/output/confusion_matrix.png', dpi=300, bbox_inches='tight')
-    print("\nConfusion matrix saved as 'Assignment3/output/confusion_matrix.png'")
-    plt.close()
-    
-    # Classification report
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=class_names))
-    
-    print("\nDone! Model saved as 'Assignment3/output/wear_lstm_model.h5'")
+    for label in label_names:
+        print(f"{label}: {per_class_acc[label]:.4f}")
+    print(f"Saved confusion matrix CSV to: {cm_csv_path}")
+    print(f"Saved confusion matrix image to: {cm_png_path}")
+
+
