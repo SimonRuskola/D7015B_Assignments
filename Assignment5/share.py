@@ -16,6 +16,7 @@ from scipy.spatial import KDTree
 from sklearn.cluster import DBSCAN
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from pathlib import Path
 
 
 #%% utility functions
@@ -29,18 +30,43 @@ def show_scatter(x,y):
     plt.show()
 
 def get_ground_level(pcd):
-    return 64
+    z_values = pcd[:, 2]
+    bin_width = 0.1
+    bin_edges = np.arange(z_values.min(), z_values.max() + bin_width, bin_width)
+    histogram, edges = np.histogram(z_values, bins=bin_edges)
+    peak_index = int(np.argmax(histogram))
+    return float((edges[peak_index] + edges[peak_index + 1]) / 2)
+
+def plot_ground_histogram(pcd, output_path):
+    z_values = pcd[:, 2]
+    bin_width = 0.1
+    bin_edges = np.arange(z_values.min(), z_values.max() + bin_width, bin_width)
+    histogram, edges = np.histogram(z_values, bins=bin_edges)
+    peak_index = int(np.argmax(histogram))
+    ground_level = float((edges[peak_index] + edges[peak_index + 1]) / 2)
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(z_values, bins=bin_edges, color='steelblue', edgecolor='white')
+    plt.title('Histogram of z-values for ground level estimation')
+    plt.xlabel('z value')
+    plt.ylabel('Number of points')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.show()
 
 
 #%% read file containing point cloud data
-pcd = np.load("dataset1.npy")
+DATA_DIR = Path(__file__).resolve().parent / "data"
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+pcd = np.load(DATA_DIR / "dataset1.npy")
 
 pcd.shape
 
 #%% show downsampled data in external window
-%matplotlib qt
+#%matplotlib qt
 show_cloud(pcd)
-#show_cloud(pcd[::10]) # keep every 10th point
+#show_cloud(pcd[::10]) 
 
 #%% remove ground plane
 
@@ -56,6 +82,8 @@ For both the datasets
 Report the ground level in the readme file in your github project
 Add the histogram plots to your project readme
 '''
+OUTPUT_DIR.mkdir(exist_ok=True)
+plot_ground_histogram(pcd, OUTPUT_DIR / "ground_histogram_dataset1.png")
 est_ground_level = get_ground_level(pcd)
 print(est_ground_level)
 
@@ -65,6 +93,7 @@ pcd_above_ground.shape
 
 #%% side view
 show_cloud(pcd_above_ground)
+#show_cloud(pcd_above_ground[::10])
 
 
 # %%
